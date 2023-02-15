@@ -1,0 +1,2309 @@
+---
+title: "MG Model 2023 training/test data"
+output:
+  html_notebook:
+    code_folding: show
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+---
+
+```{r setup}
+
+# https://github.com/phively/ksm-models/tree/master/pg-cultivation-score-fy18
+
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(rmarkdown)
+library(gam)
+library(rpart)
+library(rpart.plot)
+library(party)
+library(randomForest)
+#library(mgcv)
+library(e1071)
+#library(vctrs)
+#library(lattice)
+#library(caret)
+#library(rlang)
+#library(ggplot2)
+
+
+# Hide the dplyr .groups message
+options(dplyr.summarise.inform = FALSE)
+```
+
+
+
+```{r}
+setwd("C:/Users/zrc8929/Desktop/MG Model Refresh")
+
+model_data <- read_xlsx(path = "new_mg_score_data.xlsx", sheet = 1, guess_max = 1E6)
+
+#model_data <- "C:/Users/zrc8929/Desktop/MG Model Refresh/new_mg_score_data.xlsx"
+
+model_data$PAST_KSM_GOS <- NA
+
+# filtering for primary spouse and person
+#model_data <- model_data %>% filter(PRIMARY_FLAG == 'Y' & RECORD_STATUS_CODE == 'A') #### **** should filters include primary flag, active status? --> KEEP NON PRIMARY ENTITIES AND KEEP EVERYONE BESIDES INACTIVE AND PURGABLE
+
+
+
+# filtering for degree holders
+# model_data <- model_data %>% filter(FIRST_KSM_YEAR > 0 & FIRST_KSM_YEAR != 'NA')
+
+
+# Advanced/hybrid approach: use one across() for numeric, use another to convert character to factor
+model_data <- model_data %>% mutate(
+  across(
+    # Numeric NA becomes 0
+    .cols = is.numeric
+    , .fns = function(x) {replace_na(x, 0)}
+  )
+  , across(
+    # Character NA becomes "M" for missing
+    .cols = is.character
+    , .fns = function(x) {replace_na(x, "Missing") %>% factor()}
+  )
+)
+
+
+```
+
+
+```{r}
+######## ****** removing all non-donors ********
+
+#model_data <- model_data %>% filter(GIVING_CRU_TOTAL > 0) ### is this the correct way to filter out non donors?
+
+model_data <- model_data %>% filter(NGC_TARGET_FY2 + NGC_TARGET_FY1 > 0)  ### or is this the correct way to filter out non donors?
+
+```
+
+
+```{r}
+
+# convert first_ksm_year to numeric
+model_data$FIRST_KSM_YEAR <- as.numeric(model_data$FIRST_KSM_YEAR)
+
+```
+
+
+
+
+```{r}
+# creating "other" factor level with variables that has multiple levels less than 20 occurrences
+
+#model_data <- model_data %>% mutate(PROF_SUFFIX = fct_lump_min(PROF_SUFFIX, min = 30, other_level = "Other")
+#                                    ,PROGRAM = fct_lump_min(PROGRAM, min = 30, other_level = "Other")
+#                                    ,PREF_COUNTRY = fct_lump_min(PREF_COUNTRY, min = 30, other_level = "Other")
+#                                    ,LAST_GIFT_TYPE = fct_lump_min(LAST_GIFT_TYPE, min = 30, other_level = "Other") 
+#                                    
+#                                    
+#                                    )
+```
+
+
+
+```{r}
+# combining factor levels
+#
+#model_data$GENDER_CODE <- fct_collapse(model_data$GENDER_CODE, 
+#                                      M = c("M","U"))
+#
+#model_data$PERS_SUFFIX <- fct_collapse(model_data$PERS_SUFFIX,
+#                                      no_suffix = c("no_suffix","I", "V")) 
+#
+#
+#model_data$PROGRAM_GROUP <- fct_collapse(model_data$PROGRAM_GROUP, 
+#                                      FT = c("FT","UNK")) 
+#
+#
+#
+#model_data$FIRST_GIFT_TYPE <- fct_collapse(model_data$FIRST_GIFT_TYPE, 
+#                                      pledge = c("Pledge Payment - Gift","Pledge Payment - Grant", "Recurring Pledge Payment"))
+#
+#
+#model_data$FIRST_GIFT_TYPE <- fct_collapse(model_data$FIRST_GIFT_TYPE, 
+#                                      gift = c("Outright Gift","Non Binding Intent Payment", "Historic Matching", "Charitable Remainder Annuity Trusts"))
+
+```
+
+
+
+
+
+
+```{r}
+# creating a giving flag for logistic regression model
+
+#model_data$CRU_PFY1_Flag <- ifelse(model_data$CRU_PFY1 > 0, 1, 0)
+
+#model_data$CRU_PFY1_10K_Flag <- ifelse(model_data$CRU_PFY1 >= 10000, 1, 0)
+
+```
+
+
+
+
+
+```{r}
+#model_data$UNIVERSITY_STRATEGY_FLAG <- ifelse(model_data$UNIVERSITY_STRATEGY == "Missing", 'N', 'Y')
+```
+
+
+```{r}
+#model_data$MAJORS_COUNT <- lengths(gregexpr(";", model_data$MAJORS_CONCAT))
+```
+
+
+
+
+# Explore
+
+Check primary_flag.
+
+```{r}
+model_data %>%
+  select(HOUSEHOLD_ID, HH_PRIMARY) %>%
+  mutate(hhid = factor(HOUSEHOLD_ID), n = 1, pf = HH_PRIMARY == "Y") %>%
+  group_by(hhid) %>%
+  summarise(n = sum(n), pf = sum(pf)) %>%
+  select(n, pf) %>%
+  summary()
+```
+
+
+# Segment
+
+Block randomization is likely not needed; try without because it's easier and look at results. Use an index 1-10 for the training samples, and -1 for the test set.
+
+Always set a seed when doing randomization for reproducible results.
+
+```{r}
+set.seed(2956859)
+
+# Shuffled list of segments
+shuffled <- c(1:10, -1) %>%
+  # Repeat 1, 2, ..., 10, TEST for the length of the data frame (round up)
+  rep(ceiling(nrow(model_data)/11)) %>%
+  # Drop extra rows
+  head(nrow(model_data)) %>%
+  # Random shuffle
+  sample()
+
+# Append segment to front of model_data
+segment_data <- model_data %>%
+  mutate(sample_segment = shuffled) %>%
+  # Move new field to front
+  select(sample_segment, everything()) %>%
+  # Sort list
+  arrange(sample_segment) %>%
+  # Convert to factor
+  mutate(sample_segment = factor(sample_segment))
+```
+
+# Check
+
+First make sure the groups are approximately equal sizes.
+
+```{r}
+segment_data %>%
+  select(sample_segment) %>%
+  group_by(sample_segment) %>%
+  summarise(n = n())
+```
+
+
+```{r}
+# Dumb simple model example
+#training <- segment_data %>% filter(sample_segment != -1)
+#testing <- segment_data %>% filter(sample_segment == -1)
+```
+
+
+```{r}
+
+curr_test <- segment_data %>% filter(sample_segment == "1")
+curr_train <- segment_data %>% filter(sample_segment != "1")
+```
+
+
+```{r}
+##### ***** should I still remove tfyo and tyf1 from my models and dataframe? ******
+##### ***** double check columns to see if I should remove any additional columns or add new columns ******
+```
+
+
+
+```{r}
+
+# *** what is that trick for R to read columns that have a lot of blanks?
+
+library(ranger)
+
+
+
+curr_model <- ranger(log10(NGC_TARGET_FY2 + NGC_TARGET_FY1 + 1) ~
+# RN
+#+TRAINING_FY
+#+TARGET_FY1
+#+TARGET_FY2
+#+DATA_AS_OF
+#+ID_NUMBER
+#+REPORT_NAME
+RECORD_STATUS_CODE
++HOUSEHOLD_RECORD
+#+HOUSEHOLD_ID
++HH_PRIMARY
+#+INSTITUTIONAL_SUFFIX
++FIRST_KSM_YEAR
++BIRTH_DT
+#+ENTITY_DT_ADDED
++DEGREES_CONCAT
++PROGRAM_GROUP
++SPOUSE_FIRST_KSM_YEAR
++SPOUSE_SUFFIX
++PREF_ADDR_TYPE_CODE
++HOUSEHOLD_CITY
++HOUSEHOLD_STATE
++HOUSEHOLD_COUNTRY
++HOUSEHOLD_CONTINENT
++BUS_IS_EMPLOYED
++HAS_HOME_ADDR
++HAS_ALT_HOME_ADDR
++HAS_BUS_ADDR
++HAS_SEASONAL_ADDR
++HAS_HOME_PHONE
++HAS_BUS_PHONE
++HAS_MOBILE_PHONE
++HAS_HOME_EMAIL
++HAS_BUS_EMAIL
++GIVING_FIRST_YEAR
++GIVING_FIRST_YEAR_CASH_AMT
++GIVING_FIRST_YEAR_PLEDGE_AMT
++GIVING_MAX_CASH_FY
+#+GIVING_MAX_CASH_DT ### no data....
++GIVING_MAX_CASH_AMT
++GIVING_MAX_PLEDGE_FY
+#+GIVING_MAX_PLEDGE_DT ### no data....
++GIVING_MAX_PLEDGE_AMT
++GIVING_CASH_TOTAL
++GIVING_PLEDGE_TOTAL
++GIVING_NGC_TOTAL
++GIVING_AF_TOTAL
++GIVING_CRU_TOTAL
++GIFTS_ALLOCS_SUPPORTED
++GIFTS_FYS_SUPPORTED
++GIFTS_CASH
++GIFTS_CREDIT_CARD
++GIFTS_STOCK
++GIFTS_OUTRIGHTS_PAYMENTS
++GIFTS_PLEDGES
++GIFTS_PLEDGES_NEVER_PAID
++GIFTS_MATCHES
++DAF_GIFTS
++DAF_GIFTS_AMT
++PLEDGE_BALANCE
++NU_PLANNED_GIVING
+#+CASH_TARGET_FY2
+#+CASH_TARGET_FY1
++CASH_TFY0
++CASH_TFY1
++CASH_TFY2
++CASH_TFY3
++CASH_TFY4
+#+PLEDGE_TARGET_FY2
+#+PLEDGE_TARGET_FY1
++PLEDGE_TFY0
++PLEDGE_TFY1
++PLEDGE_TFY2
++PLEDGE_TFY3
++PLEDGE_TFY4
+#+NGC_TARGET_FY2
+#+NGC_TARGET_FY1
++NGC_TFY0
++NGC_TFY1
++NGC_TFY2
++NGC_TFY3
++NGC_TFY4
+#+AF_TARGET_FY2
+#+AF_TARGET_FY1
++AF_TFY0
++AF_TFY1
++AF_TFY2
++AF_TFY3
++AF_TFY4
+#+CRU_TARGET_FY2
+#+CRU_TARGET_FY1
++CRU_TFY0
++CRU_TFY1
++CRU_TFY2
++CRU_TFY3
++CRU_TFY4
+#+CRU_STATUS
+#+CRU_GIVING_SEGMENT
++GIFT_CLUB_KLC_YRS
++GIFT_CLUB_BEQUEST_YRS
++GIFT_CLUB_LOYAL_YRS
++GIFT_CLUB_NU_LDR_YRS
++GIFT_CLUBS_TFY0
++GIFT_CLUBS_TFY1
++GIFT_CLUBS_TFY2
++GIFT_CLUBS_TFY3
++GIFT_CLUBS_TFY4
++EVALUATION_LOWER_BOUND
++UOR_LOWER_BOUND
++KSM_PROSPECT_ACTIVE
++KSM_PROSPECT_ANY
++KSM_GOS
++KSM_GOS_FLAG
++MONTHS_ASSIGNED
+#+PAST_KSM_GOS ### getting an error for the mse when adding this to the model
++PAST_KSM_GOS_FLAG
++PAST_GO_MONTHS_ASSIGNED
++PAST_GO_MONTHS_SINCE_ASSIGNED
++VISITS_TFY0
++VISITS_TFY1
++VISITS_TFY2
++VISITS_TFY3
++VISITS_TFY4
++VISITORS_TFY0
++VISITORS_TFY1
++VISITORS_TFY2
++VISITORS_TFY3
++VISITORS_TFY4
++COMMITTEE_NU_DISTINCT
++COMMITTEE_NU_ACTIVE
++COMMITTEE_NU_YEARS
++COMMITTEE_KSM_DISTINCT
++COMMITTEE_KSM_ACTIVE
++COMMITTEE_KSM_YEARS
++COMMITTEE_KSM_LDR
++COMMITTEE_KSM_LDR_ACTIVE
++COMMITTEES_TFY0
++COMMITTEES_TFY1
++COMMITTEES_TFY2
++COMMITTEES_TFY3
++COMMITTEES_TFY4
++EVENTS_ATTENDED
++EVENTS_YRS
++EVENTS_PREV_3_FY
++KSM_EVENTS_ATTENDED
++KSM_EVENTS_YRS
++KSM_EVENTS_PREV_3_FY
++KSM_EVENTS_REUNIONS
++EVENTS_TFY0
++EVENTS_TFY1
++EVENTS_TFY2
++EVENTS_TFY3
++EVENTS_TFY4
++KSM_SPEAKER_YEARS
++KSM_SPEAKER_TIMES
++KSM_FEATURED_COMM_YEARS
++KSM_FEATURED_COMM_TIMES
++KSM_CORP_RECRUITER_YEARS
++KSM_CORP_RECRUITER_TIMES
++ATHLETICS_TICKET_YEARS
++ATHLETICS_TICKET_LAST
++ACTIVITIES_TFY0
++ACTIVITIES_TFY1
++ACTIVITIES_TFY2
++ACTIVITIES_TFY3
++ACTIVITIES_TFY4
++MANAGED_STATUS
++PHONE_COUNT
++EMAIL_COUNT
++EVENT_COUNT
++HAS_UNIVERSITY_STRATEGY_FLAG
+#+STRATEGY_SCHED_DATE ### no data....
++DEDUPED_CHILDREN_COUNT
++DEDUPED_CHILDREN_NU_COUNT
++EMAIL_TFY0
++EMAIL_TFY1
++EMAIL_TFY2
++EMAIL_TFY3
++EMAIL_TFY4
++PHONE_TFY0
++PHONE_TFY1
++PHONE_TFY2
++PHONE_TFY3
++PHONE_TFY4
+### THIS IS NOT THE FULL DATASET, just for calculating an unbiased MSE
+   , data = curr_train
+   , importance = 'impurity' ### should I use this condition for the random forest?
+ )
+```
+
+
+```{r}
+# curr_model %>% summary()
+```
+
+
+
+
+Now we have our model; we use this model to predict on the curr_test set. You need a function to define error somehow. The most basic method of defining error is based on distance between the predicted amount, and the actual amount. Typically this is some form of mean square error (MSE).
+
+$$ \text{RMSE} = \sqrt{\text{mean} \left(\left(y_i - \hat y_i\right)^2\right)} $$
+
+```{r}
+mse <- function(prediction, observed) {
+    (observed - prediction)^2 %>%
+    mean(na.rm = TRUE) %>%
+    sqrt() %>%
+    return()
+}
+```
+
+
+```{r}
+#### ***** DOES THIS LOW MSE MEAN SOME VARIABLES ARE CORRELATED WITH THE PREDICTOR VARIABLE? *******
+
+# update predict function to follow format I need
+mse(
+  prediction = {curr_model %>% predict(data = curr_test)}$predictions
+  , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+)
+```
+```{r}
+# creating data frame for predicted values
+
+predicted <- {curr_model %>% predict(data = curr_test)}$predictions
+
+predicted <- predicted %>% as.data.frame()
+
+predicted <- predicted %>% mutate(id = row_number())
+
+colnames(predicted) <- c("predicted", "id")
+
+predicted <- predicted %>% select("id", "predicted")
+
+```
+
+
+
+```{r}
+# creating data frame for actual values
+
+actual <- log10(curr_test$CRU_TFY1 + 1)
+
+actual <- as.data.frame(actual)
+
+actual <- actual %>% mutate(id = row_number())
+
+actual <- actual %>% select("id", "actual")
+```
+
+
+```{r}
+# joining predicted vs actual data frames
+predicted_vs_actual <- merge(x = predicted, y = actual, by = "id")
+```
+
+
+
+```{r}
+
+# creating predicted vs actual graph
+
+predicted_vs_actual %>% ggplot(aes(x = actual, y = predicted, color = id)) + geom_point() + geom_smooth()
+
+view(predicted_vs_actual)
+```
+
+
+
+
+
+
+# run important_pvalues
+```{r fig.height=20}
+#importance_pvalues #### ***** should I remove all variables with TFY1??? *******
+data.frame(
+  vars = names(curr_model$variable.importance) %>% unlist()
+  , importance = curr_model$variable.importance
+) %>%
+  ggplot(aes(y = reorder(vars, importance), x = importance)) +
+  geom_bar(stat = "identity")
+```
+
+
+```{r}
+
+# predicted values
+
+qqplot <- qqnorm(curr_model$predictions)
+
+#View(qqplot)
+```
+
+
+
+
+```{r}
+##### MODEL VARIABLES THAT AREN'T COLLINEAR
+
+model_variables <- model_data %>% select(
+# RN
+#,TRAINING_FY
+#,TARGET_FY1
+#,TARGET_FY2
+#,DATA_AS_OF
+#,ID_NUMBER
+#,REPORT_NAME
+RECORD_STATUS_CODE
+,HOUSEHOLD_RECORD
+#,HOUSEHOLD_ID
+,HH_PRIMARY
+#,INSTITUTIONAL_SUFFIX
+,FIRST_KSM_YEAR
+,BIRTH_DT
+#,ENTITY_DT_ADDED
+,DEGREES_CONCAT
+,PROGRAM_GROUP
+,SPOUSE_FIRST_KSM_YEAR
+,SPOUSE_SUFFIX
+,PREF_ADDR_TYPE_CODE
+,HOUSEHOLD_CITY
+,HOUSEHOLD_STATE
+,HOUSEHOLD_COUNTRY
+,HOUSEHOLD_CONTINENT
+,BUS_IS_EMPLOYED
+,HAS_HOME_ADDR
+,HAS_ALT_HOME_ADDR
+,HAS_BUS_ADDR
+,HAS_SEASONAL_ADDR
+,HAS_HOME_PHONE
+,HAS_BUS_PHONE
+,HAS_MOBILE_PHONE
+,HAS_HOME_EMAIL
+,HAS_BUS_EMAIL
+# ,GIVING_FIRST_YEAR 
+,GIVING_FIRST_YEAR_CASH_AMT
+,GIVING_FIRST_YEAR_PLEDGE_AMT
+,GIVING_MAX_CASH_FY ## can I include FY in model?
+#,GIVING_MAX_CASH_DT ### no data....
+#,GIVING_MAX_CASH_AMT
+,GIVING_MAX_PLEDGE_FY ## can I include FY in model?
+#,GIVING_MAX_PLEDGE_DT ### no data....
+# ,GIVING_MAX_PLEDGE_AMT 
+#,GIVING_CASH_TOTAL
+#,GIVING_PLEDGE_TOTAL
+#,GIVING_NGC_TOTAL
+,GIVING_AF_TOTAL
+,GIVING_CRU_TOTAL
+,GIFTS_ALLOCS_SUPPORTED
+,GIFTS_FYS_SUPPORTED
+#,GIFTS_CASH
+,GIFTS_CREDIT_CARD
+,GIFTS_STOCK
+#,GIFTS_OUTRIGHTS_PAYMENTS
+,GIFTS_PLEDGES
+,GIFTS_PLEDGES_NEVER_PAID
+,GIFTS_MATCHES
+,DAF_GIFTS
+,DAF_GIFTS_AMT
+#,PLEDGE_BALANCE
+#,NU_PLANNED_GIVING
+#,CASH_TARGET_FY2
+#,CASH_TARGET_FY1
+#,CASH_TFY0
+,CASH_TFY1
+,CASH_TFY2
+,CASH_TFY3
+,CASH_TFY4
+#,PLEDGE_TARGET_FY2
+#,PLEDGE_TARGET_FY1
+#,PLEDGE_TFY0
+#,PLEDGE_TFY1
+#,PLEDGE_TFY2
+#,PLEDGE_TFY3
+#,PLEDGE_TFY4
+#,NGC_TARGET_FY2
+#,NGC_TARGET_FY1
+,NGC_TFY0
+,NGC_TFY1
+,NGC_TFY2
+,NGC_TFY3
+,NGC_TFY4
+#,AF_TARGET_FY2
+#,AF_TARGET_FY1
+,AF_TFY0
+,AF_TFY1
+,AF_TFY2
+,AF_TFY3
+#,AF_TFY4
+#,CRU_TARGET_FY2
+#,CRU_TARGET_FY1
+#,CRU_TFY0
+#,CRU_TFY1
+,CRU_TFY2
+,CRU_TFY3
+,CRU_TFY4
+#,CRU_STATUS
+#,CRU_GIVING_SEGMENT
+,GIFT_CLUB_KLC_YRS
+,GIFT_CLUB_BEQUEST_YRS
+,GIFT_CLUB_LOYAL_YRS
+#,GIFT_CLUB_NU_LDR_YRS
+,GIFT_CLUBS_TFY0
+#,GIFT_CLUBS_TFY1
+#,GIFT_CLUBS_TFY2
+#,GIFT_CLUBS_TFY3
+#,GIFT_CLUBS_TFY4
+,EVALUATION_LOWER_BOUND
+,UOR_LOWER_BOUND
+,KSM_PROSPECT_ACTIVE
+,KSM_PROSPECT_ANY
+,KSM_GOS
+,KSM_GOS_FLAG
+,MONTHS_ASSIGNED
+,PAST_KSM_GOS
+,PAST_KSM_GOS_FLAG
+,PAST_GO_MONTHS_ASSIGNED
+,PAST_GO_MONTHS_SINCE_ASSIGNED
+,VISITS_TFY0
+#,VISITS_TFY1
+#,VISITS_TFY2
+#,VISITS_TFY3
+#,VISITS_TFY4
+#,VISITORS_TFY0
+#,VISITORS_TFY1
+#,VISITORS_TFY2
+#,VISITORS_TFY3
+#,VISITORS_TFY4
+#,COMMITTEE_NU_DISTINCT
+#,COMMITTEE_NU_ACTIVE
+#,COMMITTEE_NU_YEARS
+#,COMMITTEE_KSM_DISTINCT
+,COMMITTEE_KSM_ACTIVE
+,COMMITTEE_KSM_YEARS
+,COMMITTEE_KSM_LDR
+#,COMMITTEE_KSM_LDR_ACTIVE
+,COMMITTEES_TFY0
+#,COMMITTEES_TFY1
+,COMMITTEES_TFY2
+,COMMITTEES_TFY3
+#,COMMITTEES_TFY4
+#,EVENTS_ATTENDED # compare this column with events_ty0-4 to see which is a better predictor
+#,EVENTS_YRS
+#,EVENTS_PREV_3_FY
+,KSM_EVENTS_ATTENDED
+#,KSM_EVENTS_YRS
+#,KSM_EVENTS_PREV_3_FY
+,KSM_EVENTS_REUNIONS
+,EVENTS_TFY0
+,EVENTS_TFY1
+,EVENTS_TFY2
+,EVENTS_TFY3
+,EVENTS_TFY4
+#,KSM_SPEAKER_YEARS
+,KSM_SPEAKER_TIMES
+#,KSM_FEATURED_COMM_YEARS
+,KSM_FEATURED_COMM_TIMES
+#,KSM_CORP_RECRUITER_YEARS
+,KSM_CORP_RECRUITER_TIMES
+,ATHLETICS_TICKET_YEARS
+#,ATHLETICS_TICKET_LAST
+,ACTIVITIES_TFY0
+#,ACTIVITIES_TFY1
+#,ACTIVITIES_TFY2
+#,ACTIVITIES_TFY3
+#,ACTIVITIES_TFY4
+,MANAGED_STATUS
+,PHONE_COUNT
+#,EMAIL_COUNT ## check to see if email tfy0-4 is better predicot
+,EVENT_COUNT
+,HAS_UNIVERSITY_STRATEGY_FLAG
+#,STRATEGY_SCHED_DATE ### no data....
+,DEDUPED_CHILDREN_COUNT
+,DEDUPED_CHILDREN_NU_COUNT
+,EMAIL_TFY0
+,EMAIL_TFY1
+,EMAIL_TFY2
+,EMAIL_TFY3
+,EMAIL_TFY4
+,PHONE_TFY0
+,PHONE_TFY1
+,PHONE_TFY2
+,PHONE_TFY3
+,PHONE_TFY4
+ )
+```
+
+
+
+```{r}
+plot_corrs <- function(numeric.data, textsize = 3) {
+  cors <- cor(numeric.data) %>% round(2)
+  # Do not fill in diagonal
+  diag(cors) <- NA
+  # Plot results
+  cors %>%
+    reshape2::melt(., na.rm = TRUE) %>%
+    ggplot(aes(x = Var2, y = Var1, fill = value, label = value)) +
+    geom_tile() +
+    geom_text(size = textsize) +
+    coord_fixed() +
+    scale_fill_gradient2(low = 'blue', mid = 'white', high = 'red', limits = c (-1, 1)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .3)) %>%
+  # Return results
+  return()
+}
+```
+
+```{r, fig.width = 30, fig.height = 30}
+model_variables %>%
+  select(is.numeric) %>%
+  plot_corrs()
+```
+
+
+```{r}
+# Test - can we pull out just the numeric data and filter for abs() > .8
+
+numeric_cors <- curr_train %>%
+  select(is.numeric) %>%
+  select(-TRAINING_FY, -TARGET_FY1, -TARGET_FY2, -RN) %>%
+  cor() %>%
+  round(2)
+
+# This creates a data frame that's the same as the big matrix
+diag(numeric_cors) <- NA
+numeric_cors <- data.frame(numeric_cors)
+
+# Now make a column var1 that's the row names, this is the first variable in the correlation calc
+numeric_cors$var1 <- rownames(numeric_cors)
+# Move column to left
+numeric_cors <- numeric_cors %>% select(var1, everything())
+```
+
+```{r}
+numeric_cors %>%
+  pivot_longer(cols = FIRST_KSM_YEAR:PHONE_TFY4, names_to = 'var2', values_to = 'corr') %>%
+  filter(abs(corr) > .8) %>%
+  arrange(desc(corr))
+```
+
+
+
+Can you figure out how to plot expected vs predicted values?
+Look at the standard plot output of lm() for inspiration
+Observed vs Expected values, with a linear and polynomial line of best fit
+
+
+```{r}
+
+# *** what is that trick for R to read columns that have a lot of blanks?
+
+
+lm_curr_model <- lm(log10(NGC_TARGET_FY2 + NGC_TARGET_FY1 + 1) ~ 
+# RN
+#+TRAINING_FY
+#+TARGET_FY1
+#+TARGET_FY2
+#+DATA_AS_OF
+#+ID_NUMBER
+#+REPORT_NAME
+#RECORD_STATUS_CODE
+#+HOUSEHOLD_RECORD
+#+HOUSEHOLD_ID
+#+HH_PRIMARY
+#+INSTITUTIONAL_SUFFIX
++FIRST_KSM_YEAR
+#+BIRTH_DT
+#+ENTITY_DT_ADDED
+#+DEGREES_CONCAT
++PROGRAM_GROUP
+#+SPOUSE_FIRST_KSM_YEAR
+#+SPOUSE_SUFFIX
++PREF_ADDR_TYPE_CODE
+#+HOUSEHOLD_CITY
+#+HOUSEHOLD_STATE
+#+HOUSEHOLD_COUNTRY
++HOUSEHOLD_CONTINENT
++BUS_IS_EMPLOYED
++HAS_HOME_ADDR
++HAS_ALT_HOME_ADDR
++HAS_BUS_ADDR
++HAS_SEASONAL_ADDR
++HAS_HOME_PHONE
++HAS_BUS_PHONE
++HAS_MOBILE_PHONE
++HAS_HOME_EMAIL
++HAS_BUS_EMAIL
+# +GIVING_FIRST_YEAR 
++GIVING_FIRST_YEAR_CASH_AMT
++GIVING_FIRST_YEAR_PLEDGE_AMT
++GIVING_MAX_CASH_FY ## can I include FY in model?
+#+GIVING_MAX_CASH_DT ### no data....
+#+GIVING_MAX_CASH_AMT
++GIVING_MAX_PLEDGE_FY ## can I include FY in model?
+#+GIVING_MAX_PLEDGE_DT ### no data....
+# +GIVING_MAX_PLEDGE_AMT 
+#+GIVING_CASH_TOTAL
+#+GIVING_PLEDGE_TOTAL
+#+GIVING_NGC_TOTAL
++GIVING_AF_TOTAL
++GIVING_CRU_TOTAL
++GIFTS_ALLOCS_SUPPORTED
++GIFTS_FYS_SUPPORTED
+#+GIFTS_CASH
++GIFTS_CREDIT_CARD
++GIFTS_STOCK
+#+GIFTS_OUTRIGHTS_PAYMENTS
++GIFTS_PLEDGES
++GIFTS_PLEDGES_NEVER_PAID
++GIFTS_MATCHES
++DAF_GIFTS
++DAF_GIFTS_AMT
+#+PLEDGE_BALANCE
+#+NU_PLANNED_GIVING
+#+CASH_TARGET_FY2
+#+CASH_TARGET_FY1
+#+CASH_TFY0
++CASH_TFY1
++CASH_TFY2
++CASH_TFY3
++CASH_TFY4
+#+PLEDGE_TARGET_FY2
+#+PLEDGE_TARGET_FY1
+#+PLEDGE_TFY0
+#+PLEDGE_TFY1
+#+PLEDGE_TFY2
+#+PLEDGE_TFY3
+#+PLEDGE_TFY4
+#+NGC_TARGET_FY2
+#+NGC_TARGET_FY1
++NGC_TFY0
++NGC_TFY1
++NGC_TFY2
++NGC_TFY3
++NGC_TFY4
+#+AF_TARGET_FY2
+#+AF_TARGET_FY1
++AF_TFY0
++AF_TFY1
++AF_TFY2
++AF_TFY3
+#+AF_TFY4
+#+CRU_TARGET_FY2
+#+CRU_TARGET_FY1
+#+CRU_TFY0
+#+CRU_TFY1
++CRU_TFY2
++CRU_TFY3
++CRU_TFY4
+#+CRU_STATUS
+#+CRU_GIVING_SEGMENT
++GIFT_CLUB_KLC_YRS
++GIFT_CLUB_BEQUEST_YRS
++GIFT_CLUB_LOYAL_YRS
+#+GIFT_CLUB_NU_LDR_YRS
++GIFT_CLUBS_TFY0
+#+GIFT_CLUBS_TFY1
+#+GIFT_CLUBS_TFY2
+#+GIFT_CLUBS_TFY3
+#+GIFT_CLUBS_TFY4
++EVALUATION_LOWER_BOUND
++UOR_LOWER_BOUND
++KSM_PROSPECT_ACTIVE
++KSM_PROSPECT_ANY
++KSM_GOS
++KSM_GOS_FLAG
++MONTHS_ASSIGNED
+#+PAST_KSM_GOS ### getting an error for the mse when adding this to the model
++PAST_KSM_GOS_FLAG
++PAST_GO_MONTHS_ASSIGNED
++PAST_GO_MONTHS_SINCE_ASSIGNED
++VISITS_TFY0
+#+VISITS_TFY1
+#+VISITS_TFY2
+#+VISITS_TFY3
+#+VISITS_TFY4
+#+VISITORS_TFY0
+#+VISITORS_TFY1
+#+VISITORS_TFY2
+#+VISITORS_TFY3
+#+VISITORS_TFY4
+#+COMMITTEE_NU_DISTINCT
+#+COMMITTEE_NU_ACTIVE
+#+COMMITTEE_NU_YEARS
+#+COMMITTEE_KSM_DISTINCT
++COMMITTEE_KSM_ACTIVE
++COMMITTEE_KSM_YEARS
++COMMITTEE_KSM_LDR
+#+COMMITTEE_KSM_LDR_ACTIVE
++COMMITTEES_TFY0
+#+COMMITTEES_TFY1
++COMMITTEES_TFY2
++COMMITTEES_TFY3
+#+COMMITTEES_TFY4
+#+EVENTS_ATTENDED # compare this column with events_ty0-4 to see which is a better predictor
+#+EVENTS_YRS
+#+EVENTS_PREV_3_FY
++KSM_EVENTS_ATTENDED
+#+KSM_EVENTS_YRS
+#+KSM_EVENTS_PREV_3_FY
++KSM_EVENTS_REUNIONS
++EVENTS_TFY0
++EVENTS_TFY1
++EVENTS_TFY2
++EVENTS_TFY3
++EVENTS_TFY4
+#+KSM_SPEAKER_YEARS
++KSM_SPEAKER_TIMES
+#+KSM_FEATURED_COMM_YEARS
++KSM_FEATURED_COMM_TIMES
+#+KSM_CORP_RECRUITER_YEARS
++KSM_CORP_RECRUITER_TIMES
++ATHLETICS_TICKET_YEARS
+#+ATHLETICS_TICKET_LAST
++ACTIVITIES_TFY0
+#+ACTIVITIES_TFY1
+#+ACTIVITIES_TFY2
+#+ACTIVITIES_TFY3
+#+ACTIVITIES_TFY4
++MANAGED_STATUS
++PHONE_COUNT
+#+EMAIL_COUNT ## check to see if email tfy0-4 is better predicot
++EVENT_COUNT
++HAS_UNIVERSITY_STRATEGY_FLAG
+#+STRATEGY_SCHED_DATE ### no data....
++DEDUPED_CHILDREN_COUNT
++DEDUPED_CHILDREN_NU_COUNT
++EMAIL_TFY0
++EMAIL_TFY1
++EMAIL_TFY2
++EMAIL_TFY3
++EMAIL_TFY4
++PHONE_TFY0
++PHONE_TFY1
++PHONE_TFY2
++PHONE_TFY3
++PHONE_TFY4
+### THIS IS NOT THE FULL DATASET, just for calculating an unbiased MSE
+   , data = curr_train
+ #  , importance = 'impurity' ### should I use this condition for the random forest?
+ )
+```
+
+
+```{r}
+#lm_curr_model%>% summary()
+```
+
+
+```{r}
+### what is the difference between data and newdata when predicting?
+
+mse(
+    prediction = lm_curr_model %>% predict(newdata = curr_test, type = "response")
+    , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+  )
+```
+
+
+
+
+```{r}
+
+# *** what is that trick for R to read columns that have a lot of blanks?
+
+
+
+gam_curr_model <- gam(log10(NGC_TARGET_FY2 + NGC_TARGET_FY1 + 1) ~
+# RN
+#+TRAINING_FY
+#+TARGET_FY1
+#+TARGET_FY2
+#+DATA_AS_OF
+#+ID_NUMBER
+#+REPORT_NAME
+#RECORD_STATUS_CODE
+#+HOUSEHOLD_RECORD
+#+HOUSEHOLD_ID
+#+HH_PRIMARY
+#+INSTITUTIONAL_SUFFIX
++FIRST_KSM_YEAR
+#+BIRTH_DT
+#+ENTITY_DT_ADDED
+#+DEGREES_CONCAT
++PROGRAM_GROUP
+#+SPOUSE_FIRST_KSM_YEAR
+#+SPOUSE_SUFFIX
++PREF_ADDR_TYPE_CODE
+#+HOUSEHOLD_CITY
+#+HOUSEHOLD_STATE
+#+HOUSEHOLD_COUNTRY
++HOUSEHOLD_CONTINENT
++BUS_IS_EMPLOYED
++HAS_HOME_ADDR
++HAS_ALT_HOME_ADDR
++HAS_BUS_ADDR
++HAS_SEASONAL_ADDR
++HAS_HOME_PHONE
++HAS_BUS_PHONE
++HAS_MOBILE_PHONE
++HAS_HOME_EMAIL
++HAS_BUS_EMAIL
+# +GIVING_FIRST_YEAR 
++GIVING_FIRST_YEAR_CASH_AMT
++GIVING_FIRST_YEAR_PLEDGE_AMT
++GIVING_MAX_CASH_FY ## can I include FY in model?
+#+GIVING_MAX_CASH_DT ### no data....
+#+GIVING_MAX_CASH_AMT
++GIVING_MAX_PLEDGE_FY ## can I include FY in model?
+#+GIVING_MAX_PLEDGE_DT ### no data....
+# +GIVING_MAX_PLEDGE_AMT 
+#+GIVING_CASH_TOTAL
+#+GIVING_PLEDGE_TOTAL
+#+GIVING_NGC_TOTAL
++GIVING_AF_TOTAL
++GIVING_CRU_TOTAL
++GIFTS_ALLOCS_SUPPORTED
++GIFTS_FYS_SUPPORTED
+#+GIFTS_CASH
++GIFTS_CREDIT_CARD
++GIFTS_STOCK
+#+GIFTS_OUTRIGHTS_PAYMENTS
++GIFTS_PLEDGES
++GIFTS_PLEDGES_NEVER_PAID
++GIFTS_MATCHES
++DAF_GIFTS
++DAF_GIFTS_AMT
+#+PLEDGE_BALANCE
+#+NU_PLANNED_GIVING
+#+CASH_TARGET_FY2
+#+CASH_TARGET_FY1
+#+CASH_TFY0
++CASH_TFY1
++CASH_TFY2
++CASH_TFY3
++CASH_TFY4
+#+PLEDGE_TARGET_FY2
+#+PLEDGE_TARGET_FY1
+#+PLEDGE_TFY0
+#+PLEDGE_TFY1
+#+PLEDGE_TFY2
+#+PLEDGE_TFY3
+#+PLEDGE_TFY4
+#+NGC_TARGET_FY2
+#+NGC_TARGET_FY1
++NGC_TFY0
++NGC_TFY1
++NGC_TFY2
++NGC_TFY3
++NGC_TFY4
+#+AF_TARGET_FY2
+#+AF_TARGET_FY1
++AF_TFY0
++AF_TFY1
++AF_TFY2
++AF_TFY3
+#+AF_TFY4
+#+CRU_TARGET_FY2
+#+CRU_TARGET_FY1
+#+CRU_TFY0
+#+CRU_TFY1
++CRU_TFY2
++CRU_TFY3
++CRU_TFY4
+#+CRU_STATUS
+#+CRU_GIVING_SEGMENT
++GIFT_CLUB_KLC_YRS
++GIFT_CLUB_BEQUEST_YRS
++GIFT_CLUB_LOYAL_YRS
+#+GIFT_CLUB_NU_LDR_YRS
++GIFT_CLUBS_TFY0
+#+GIFT_CLUBS_TFY1
+#+GIFT_CLUBS_TFY2
+#+GIFT_CLUBS_TFY3
+#+GIFT_CLUBS_TFY4
++EVALUATION_LOWER_BOUND
++UOR_LOWER_BOUND
++KSM_PROSPECT_ACTIVE
++KSM_PROSPECT_ANY
++KSM_GOS
++KSM_GOS_FLAG
++MONTHS_ASSIGNED
+#+PAST_KSM_GOS ### getting an error for the mse when adding this to the model
++PAST_KSM_GOS_FLAG
++PAST_GO_MONTHS_ASSIGNED
++PAST_GO_MONTHS_SINCE_ASSIGNED
++VISITS_TFY0
+#+VISITS_TFY1
+#+VISITS_TFY2
+#+VISITS_TFY3
+#+VISITS_TFY4
+#+VISITORS_TFY0
+#+VISITORS_TFY1
+#+VISITORS_TFY2
+#+VISITORS_TFY3
+#+VISITORS_TFY4
+#+COMMITTEE_NU_DISTINCT
+#+COMMITTEE_NU_ACTIVE
+#+COMMITTEE_NU_YEARS
+#+COMMITTEE_KSM_DISTINCT
++COMMITTEE_KSM_ACTIVE
++COMMITTEE_KSM_YEARS
++COMMITTEE_KSM_LDR
+#+COMMITTEE_KSM_LDR_ACTIVE
++COMMITTEES_TFY0
+#+COMMITTEES_TFY1
++COMMITTEES_TFY2
++COMMITTEES_TFY3
+#+COMMITTEES_TFY4
+#+EVENTS_ATTENDED # compare this column with events_ty0-4 to see which is a better predictor
+#+EVENTS_YRS
+#+EVENTS_PREV_3_FY
++KSM_EVENTS_ATTENDED
+#+KSM_EVENTS_YRS
+#+KSM_EVENTS_PREV_3_FY
++KSM_EVENTS_REUNIONS
++EVENTS_TFY0
++EVENTS_TFY1
++EVENTS_TFY2
++EVENTS_TFY3
++EVENTS_TFY4
+#+KSM_SPEAKER_YEARS
++KSM_SPEAKER_TIMES
+#+KSM_FEATURED_COMM_YEARS
++KSM_FEATURED_COMM_TIMES
+#+KSM_CORP_RECRUITER_YEARS
++KSM_CORP_RECRUITER_TIMES
++ATHLETICS_TICKET_YEARS
+#+ATHLETICS_TICKET_LAST
++ACTIVITIES_TFY0
+#+ACTIVITIES_TFY1
+#+ACTIVITIES_TFY2
+#+ACTIVITIES_TFY3
+#+ACTIVITIES_TFY4
++MANAGED_STATUS
++PHONE_COUNT
+#+EMAIL_COUNT ## check to see if email tfy0-4 is better predicot
++EVENT_COUNT
++HAS_UNIVERSITY_STRATEGY_FLAG
+#+STRATEGY_SCHED_DATE ### no data....
++DEDUPED_CHILDREN_COUNT
++DEDUPED_CHILDREN_NU_COUNT
++EMAIL_TFY0
++EMAIL_TFY1
++EMAIL_TFY2
++EMAIL_TFY3
++EMAIL_TFY4
++PHONE_TFY0
++PHONE_TFY1
++PHONE_TFY2
++PHONE_TFY3
++PHONE_TFY4
+### THIS IS NOT THE FULL DATASET, just for calculating an unbiased MSE
+   , data = curr_train
+   , importance = 'impurity' ### should I use this condition for the random forest?
+ )
+```
+
+
+```{r}
+#gam_curr_model%>% summary()
+```
+
+
+```{r}
+### what is the difference between data and newdata when predicting?
+
+mse(
+    prediction = gam_curr_model %>% predict(newdata = curr_test, type = "response")
+    , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+  )
+```
+
+
+```{r}
+gam_test1_model <- gam(log10(NGC_TARGET_FY2 + NGC_TARGET_FY1 + 1) ~
+# RN
+#+TRAINING_FY
+#+TARGET_FY1
+#+TARGET_FY2
+#+DATA_AS_OF
+#+ID_NUMBER
+#+REPORT_NAME
+#RECORD_STATUS_CODE
+#+HOUSEHOLD_RECORD
+#+HOUSEHOLD_ID
+#+HH_PRIMARY
+#+INSTITUTIONAL_SUFFIX
+s(FIRST_KSM_YEAR, df = 4)
+#+BIRTH_DT
+#+ENTITY_DT_ADDED
+#+DEGREES_CONCAT
++PROGRAM_GROUP
+#+SPOUSE_FIRST_KSM_YEAR
+#+SPOUSE_SUFFIX
++PREF_ADDR_TYPE_CODE
+#+HOUSEHOLD_CITY
+#+HOUSEHOLD_STATE
+#+HOUSEHOLD_COUNTRY
++HOUSEHOLD_CONTINENT
++BUS_IS_EMPLOYED
++HAS_HOME_ADDR
++HAS_ALT_HOME_ADDR
++HAS_BUS_ADDR
++HAS_SEASONAL_ADDR
++HAS_HOME_PHONE
++HAS_BUS_PHONE
++HAS_MOBILE_PHONE
++HAS_HOME_EMAIL
++HAS_BUS_EMAIL
+# +GIVING_FIRST_YEAR 
++s(GIVING_FIRST_YEAR_CASH_AMT, 4)
++s(GIVING_FIRST_YEAR_PLEDGE_AMT, 4)
++s(GIVING_MAX_CASH_FY, 4) ## can I include FY in model?
+#+GIVING_MAX_CASH_DT ### no data....
+#+GIVING_MAX_CASH_AMT
++GIVING_MAX_PLEDGE_FY ## can I include FY in model?
+#+GIVING_MAX_PLEDGE_DT ### no data....
+# +GIVING_MAX_PLEDGE_AMT 
+#+GIVING_CASH_TOTAL
+#+GIVING_PLEDGE_TOTAL
+#+GIVING_NGC_TOTAL
++GIVING_AF_TOTAL
++GIVING_CRU_TOTAL
++GIFTS_ALLOCS_SUPPORTED
++GIFTS_FYS_SUPPORTED
+#+GIFTS_CASH
++GIFTS_CREDIT_CARD
++GIFTS_STOCK
+#+GIFTS_OUTRIGHTS_PAYMENTS
++GIFTS_PLEDGES
++GIFTS_PLEDGES_NEVER_PAID
++GIFTS_MATCHES
++DAF_GIFTS
++DAF_GIFTS_AMT
+#+PLEDGE_BALANCE
+#+NU_PLANNED_GIVING
+#+CASH_TARGET_FY2
+#+CASH_TARGET_FY1
+#+CASH_TFY0
++CASH_TFY1
++CASH_TFY2
++CASH_TFY3
++CASH_TFY4
+#+PLEDGE_TARGET_FY2
+#+PLEDGE_TARGET_FY1
+#+PLEDGE_TFY0
+#+PLEDGE_TFY1
+#+PLEDGE_TFY2
+#+PLEDGE_TFY3
+#+PLEDGE_TFY4
+#+NGC_TARGET_FY2
+#+NGC_TARGET_FY1
++NGC_TFY0
++NGC_TFY1
++NGC_TFY2
++NGC_TFY3
++NGC_TFY4
+#+AF_TARGET_FY2
+#+AF_TARGET_FY1
++AF_TFY0
++AF_TFY1
++AF_TFY2
++AF_TFY3
+#+AF_TFY4
+#+CRU_TARGET_FY2
+#+CRU_TARGET_FY1
+#+CRU_TFY0
+#+CRU_TFY1
++CRU_TFY2
++CRU_TFY3
++CRU_TFY4
+#+CRU_STATUS
+#+CRU_GIVING_SEGMENT
++GIFT_CLUB_KLC_YRS
++GIFT_CLUB_BEQUEST_YRS
++GIFT_CLUB_LOYAL_YRS
+#+GIFT_CLUB_NU_LDR_YRS
++GIFT_CLUBS_TFY0
+#+GIFT_CLUBS_TFY1
+#+GIFT_CLUBS_TFY2
+#+GIFT_CLUBS_TFY3
+#+GIFT_CLUBS_TFY4
++EVALUATION_LOWER_BOUND
++UOR_LOWER_BOUND
++KSM_PROSPECT_ACTIVE
++KSM_PROSPECT_ANY
++KSM_GOS
++KSM_GOS_FLAG
++MONTHS_ASSIGNED
+#+PAST_KSM_GOS ### getting an error for the mse when adding this to the model
++PAST_KSM_GOS_FLAG
++PAST_GO_MONTHS_ASSIGNED
++PAST_GO_MONTHS_SINCE_ASSIGNED
++VISITS_TFY0
+#+VISITS_TFY1
+#+VISITS_TFY2
+#+VISITS_TFY3
+#+VISITS_TFY4
+#+VISITORS_TFY0
+#+VISITORS_TFY1
+#+VISITORS_TFY2
+#+VISITORS_TFY3
+#+VISITORS_TFY4
+#+COMMITTEE_NU_DISTINCT
+#+COMMITTEE_NU_ACTIVE
+#+COMMITTEE_NU_YEARS
+#+COMMITTEE_KSM_DISTINCT
++COMMITTEE_KSM_ACTIVE
++COMMITTEE_KSM_YEARS
++COMMITTEE_KSM_LDR
+#+COMMITTEE_KSM_LDR_ACTIVE
++COMMITTEES_TFY0
+#+COMMITTEES_TFY1
++COMMITTEES_TFY2
++COMMITTEES_TFY3
+#+COMMITTEES_TFY4
+#+EVENTS_ATTENDED # compare this column with events_ty0-4 to see which is a better predictor
+#+EVENTS_YRS
+#+EVENTS_PREV_3_FY
++KSM_EVENTS_ATTENDED
+#+KSM_EVENTS_YRS
+#+KSM_EVENTS_PREV_3_FY
++KSM_EVENTS_REUNIONS
++EVENTS_TFY0
++EVENTS_TFY1
++EVENTS_TFY2
++EVENTS_TFY3
++EVENTS_TFY4
+#+KSM_SPEAKER_YEARS
++KSM_SPEAKER_TIMES
+#+KSM_FEATURED_COMM_YEARS
++KSM_FEATURED_COMM_TIMES
+#+KSM_CORP_RECRUITER_YEARS
++KSM_CORP_RECRUITER_TIMES
++ATHLETICS_TICKET_YEARS
+#+ATHLETICS_TICKET_LAST
++ACTIVITIES_TFY0
+#+ACTIVITIES_TFY1
+#+ACTIVITIES_TFY2
+#+ACTIVITIES_TFY3
+#+ACTIVITIES_TFY4
++MANAGED_STATUS
++PHONE_COUNT
+#+EMAIL_COUNT ## check to see if email tfy0-4 is better predicot
++EVENT_COUNT
++HAS_UNIVERSITY_STRATEGY_FLAG
+#+STRATEGY_SCHED_DATE ### no data....
++DEDUPED_CHILDREN_COUNT
++DEDUPED_CHILDREN_NU_COUNT
++EMAIL_TFY0
++EMAIL_TFY1
++EMAIL_TFY2
++EMAIL_TFY3
++EMAIL_TFY4
++PHONE_TFY0
++PHONE_TFY1
++PHONE_TFY2
++PHONE_TFY3
++PHONE_TFY4
+### THIS IS NOT THE FULL DATASET, just for calculating an unbiased MSE
+   , data = curr_train
+   , importance = 'impurity' ### should I use this condition for the random forest?
+ )
+
+
+```
+
+
+```{r}
+#gam_test1_model %>% summary()
+```
+
+
+```{r}
+mse(
+    prediction = gam_test1_model %>% predict(newdata = curr_test, type = "response")
+    , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+  )
+```
+
+
+```{r}
+# #### ***** NOT SURE WHY THIS ISN'T WORKING
+# 
+#
+# mse(
+#   prediction = {lm_curr_model %>% predict(data = curr_test)}$predictions
+#   , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+# )
+
+```
+
+
+
+```{r}
+# gam_test2_model <- gam(log10(NGC_TARGET_FY2 + NGC_TARGET_FY1 + 1) ~
+# # RN
+# #+TRAINING_FY
+# #+TARGET_FY1
+# #+TARGET_FY2
+# #+DATA_AS_OF
+# #+ID_NUMBER
+# #+REPORT_NAME
+# #RECORD_STATUS_CODE
+# #+HOUSEHOLD_RECORD
+# #+HOUSEHOLD_ID
+# #+HH_PRIMARY
+# #+INSTITUTIONAL_SUFFIX
+# te(FIRST_KSM_YEAR, df = 4)
+# #+BIRTH_DT
+# #+ENTITY_DT_ADDED
+# #+DEGREES_CONCAT
+# +PROGRAM_GROUP
+# #+SPOUSE_FIRST_KSM_YEAR
+# #+SPOUSE_SUFFIX
+# +PREF_ADDR_TYPE_CODE
+# #+HOUSEHOLD_CITY
+# #+HOUSEHOLD_STATE
+# #+HOUSEHOLD_COUNTRY
+# +HOUSEHOLD_CONTINENT
+# +BUS_IS_EMPLOYED
+# +HAS_HOME_ADDR
+# +HAS_ALT_HOME_ADDR
+# +HAS_BUS_ADDR
+# +HAS_SEASONAL_ADDR
+# +HAS_HOME_PHONE
+# +HAS_BUS_PHONE
+# +HAS_MOBILE_PHONE
+# +HAS_HOME_EMAIL
+# +HAS_BUS_EMAIL
+# # +GIVING_FIRST_YEAR 
+# +te(GIVING_FIRST_YEAR_CASH_AMT, 4)
+# +te(GIVING_FIRST_YEAR_PLEDGE_AMT, 4)
+# +te(GIVING_MAX_CASH_FY, 4) ## can I include FY in model?
+# #+GIVING_MAX_CASH_DT ### no data....
+# #+GIVING_MAX_CASH_AMT
+# +GIVING_MAX_PLEDGE_FY ## can I include FY in model?
+# #+GIVING_MAX_PLEDGE_DT ### no data....
+# # +GIVING_MAX_PLEDGE_AMT 
+# #+GIVING_CASH_TOTAL
+# #+GIVING_PLEDGE_TOTAL
+# #+GIVING_NGC_TOTAL
+# +GIVING_AF_TOTAL
+# +GIVING_CRU_TOTAL
+# +GIFTS_ALLOCS_SUPPORTED
+# +GIFTS_FYS_SUPPORTED
+# #+GIFTS_CASH
+# +GIFTS_CREDIT_CARD
+# +GIFTS_STOCK
+# #+GIFTS_OUTRIGHTS_PAYMENTS
+# +GIFTS_PLEDGES
+# +GIFTS_PLEDGES_NEVER_PAID
+# +GIFTS_MATCHES
+# +DAF_GIFTS
+# +DAF_GIFTS_AMT
+# #+PLEDGE_BALANCE
+# #+NU_PLANNED_GIVING
+# #+CASH_TARGET_FY2
+# #+CASH_TARGET_FY1
+# #+CASH_TFY0
+# +CASH_TFY1
+# +CASH_TFY2
+# +CASH_TFY3
+# +CASH_TFY4
+# #+PLEDGE_TARGET_FY2
+# #+PLEDGE_TARGET_FY1
+# #+PLEDGE_TFY0
+# #+PLEDGE_TFY1
+# #+PLEDGE_TFY2
+# #+PLEDGE_TFY3
+# #+PLEDGE_TFY4
+# #+NGC_TARGET_FY2
+# #+NGC_TARGET_FY1
+# +NGC_TFY0
+# +NGC_TFY1
+# +NGC_TFY2
+# +NGC_TFY3
+# +NGC_TFY4
+# #+AF_TARGET_FY2
+# #+AF_TARGET_FY1
+# +AF_TFY0
+# +AF_TFY1
+# +AF_TFY2
+# +AF_TFY3
+# #+AF_TFY4
+# #+CRU_TARGET_FY2
+# #+CRU_TARGET_FY1
+# #+CRU_TFY0
+# #+CRU_TFY1
+# +CRU_TFY2
+# +CRU_TFY3
+# +CRU_TFY4
+# #+CRU_STATUS
+# #+CRU_GIVING_SEGMENT
+# +GIFT_CLUB_KLC_YRS
+# +GIFT_CLUB_BEQUEST_YRS
+# +GIFT_CLUB_LOYAL_YRS
+# #+GIFT_CLUB_NU_LDR_YRS
+# +GIFT_CLUBS_TFY0
+# #+GIFT_CLUBS_TFY1
+# #+GIFT_CLUBS_TFY2
+# #+GIFT_CLUBS_TFY3
+# #+GIFT_CLUBS_TFY4
+# +EVALUATION_LOWER_BOUND
+# +UOR_LOWER_BOUND
+# +KSM_PROSPECT_ACTIVE
+# +KSM_PROSPECT_ANY
+# +KSM_GOS
+# +KSM_GOS_FLAG
+# +MONTHS_ASSIGNED
+# #+PAST_KSM_GOS ### getting an error for the mse when adding this to the model
+# +PAST_KSM_GOS_FLAG
+# +PAST_GO_MONTHS_ASSIGNED
+# +PAST_GO_MONTHS_SINCE_ASSIGNED
+# +VISITS_TFY0
+# #+VISITS_TFY1
+# #+VISITS_TFY2
+# #+VISITS_TFY3
+# #+VISITS_TFY4
+# #+VISITORS_TFY0
+# #+VISITORS_TFY1
+# #+VISITORS_TFY2
+# #+VISITORS_TFY3
+# #+VISITORS_TFY4
+# #+COMMITTEE_NU_DISTINCT
+# #+COMMITTEE_NU_ACTIVE
+# #+COMMITTEE_NU_YEARS
+# #+COMMITTEE_KSM_DISTINCT
+# +COMMITTEE_KSM_ACTIVE
+# +COMMITTEE_KSM_YEARS
+# +COMMITTEE_KSM_LDR
+# #+COMMITTEE_KSM_LDR_ACTIVE
+# +COMMITTEES_TFY0
+# #+COMMITTEES_TFY1
+# +COMMITTEES_TFY2
+# +COMMITTEES_TFY3
+# #+COMMITTEES_TFY4
+# #+EVENTS_ATTENDED # compare this column with events_ty0-4 to see which is a better predictor
+# #+EVENTS_YRS
+# #+EVENTS_PREV_3_FY
+# +KSM_EVENTS_ATTENDED
+# #+KSM_EVENTS_YRS
+# #+KSM_EVENTS_PREV_3_FY
+# +KSM_EVENTS_REUNIONS
+# +EVENTS_TFY0
+# +EVENTS_TFY1
+# +EVENTS_TFY2
+# +EVENTS_TFY3
+# +EVENTS_TFY4
+# #+KSM_SPEAKER_YEARS
+# +KSM_SPEAKER_TIMES
+# #+KSM_FEATURED_COMM_YEARS
+# +KSM_FEATURED_COMM_TIMES
+# #+KSM_CORP_RECRUITER_YEARS
+# +KSM_CORP_RECRUITER_TIMES
+# +ATHLETICS_TICKET_YEARS
+# #+ATHLETICS_TICKET_LAST
+# +ACTIVITIES_TFY0
+# #+ACTIVITIES_TFY1
+# #+ACTIVITIES_TFY2
+# #+ACTIVITIES_TFY3
+# #+ACTIVITIES_TFY4
+# +MANAGED_STATUS
+# +PHONE_COUNT
+# #+EMAIL_COUNT ## check to see if email tfy0-4 is better predicot
+# +EVENT_COUNT
+# +HAS_UNIVERSITY_STRATEGY_FLAG
+# #+STRATEGY_SCHED_DATE ### no data....
+# +DEDUPED_CHILDREN_COUNT
+# +DEDUPED_CHILDREN_NU_COUNT
+# +EMAIL_TFY0
+# +EMAIL_TFY1
+# +EMAIL_TFY2
+# +EMAIL_TFY3
+# +EMAIL_TFY4
+# +PHONE_TFY0
+# +PHONE_TFY1
+# +PHONE_TFY2
+# +PHONE_TFY3
+# +PHONE_TFY4
+# ### THIS IS NOT THE FULL DATASET, just for calculating an unbiased MSE
+#    , data = curr_train
+#    , importance = 'impurity' ### should I use this condition for the random forest?
+#  )
+
+
+```
+
+```{r}
+# gam_test2_model %>% summary()
+```
+
+
+```{r}
+# mse(
+#     prediction = gam_test2_model %>% predict(newdata = curr_test, type = "response")
+#     , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+#   )
+```
+
+
+
+```{r}
+# gam_test3_model <- gam(log10(NGC_TARGET_FY2 + NGC_TARGET_FY1 + 1) ~
+# # RN
+# #+TRAINING_FY
+# #+TARGET_FY1
+# #+TARGET_FY2
+# #+DATA_AS_OF
+# #+ID_NUMBER
+# #+REPORT_NAME
+# #RECORD_STATUS_CODE
+# #+HOUSEHOLD_RECORD
+# #+HOUSEHOLD_ID
+# #+HH_PRIMARY
+# #+INSTITUTIONAL_SUFFIX
+# ti(FIRST_KSM_YEAR, df = 4)
+# #+BIRTH_DT
+# #+ENTITY_DT_ADDED
+# #+DEGREES_CONCAT
+# +PROGRAM_GROUP
+# #+SPOUSE_FIRST_KSM_YEAR
+# #+SPOUSE_SUFFIX
+# +PREF_ADDR_TYPE_CODE
+# #+HOUSEHOLD_CITY
+# #+HOUSEHOLD_STATE
+# #+HOUSEHOLD_COUNTRY
+# +HOUSEHOLD_CONTINENT
+# +BUS_IS_EMPLOYED
+# +HAS_HOME_ADDR
+# +HAS_ALT_HOME_ADDR
+# +HAS_BUS_ADDR
+# +HAS_SEASONAL_ADDR
+# +HAS_HOME_PHONE
+# +HAS_BUS_PHONE
+# +HAS_MOBILE_PHONE
+# +HAS_HOME_EMAIL
+# +HAS_BUS_EMAIL
+# # +GIVING_FIRST_YEAR 
+# +ti(GIVING_FIRST_YEAR_CASH_AMT, 4)
+# +ti(GIVING_FIRST_YEAR_PLEDGE_AMT, 4)
+# +ti(GIVING_MAX_CASH_FY, 4) ## can I include FY in model?
+# #+GIVING_MAX_CASH_DT ### no data....
+# #+GIVING_MAX_CASH_AMT
+# +GIVING_MAX_PLEDGE_FY ## can I include FY in model?
+# #+GIVING_MAX_PLEDGE_DT ### no data....
+# # +GIVING_MAX_PLEDGE_AMT 
+# #+GIVING_CASH_TOTAL
+# #+GIVING_PLEDGE_TOTAL
+# #+GIVING_NGC_TOTAL
+# +GIVING_AF_TOTAL
+# +GIVING_CRU_TOTAL
+# +GIFTS_ALLOCS_SUPPORTED
+# +GIFTS_FYS_SUPPORTED
+# #+GIFTS_CASH
+# +GIFTS_CREDIT_CARD
+# +GIFTS_STOCK
+# #+GIFTS_OUTRIGHTS_PAYMENTS
+# +GIFTS_PLEDGES
+# +GIFTS_PLEDGES_NEVER_PAID
+# +GIFTS_MATCHES
+# +DAF_GIFTS
+# +DAF_GIFTS_AMT
+# #+PLEDGE_BALANCE
+# #+NU_PLANNED_GIVING
+# #+CASH_TARGET_FY2
+# #+CASH_TARGET_FY1
+# #+CASH_TFY0
+# +CASH_TFY1
+# +CASH_TFY2
+# +CASH_TFY3
+# +CASH_TFY4
+# #+PLEDGE_TARGET_FY2
+# #+PLEDGE_TARGET_FY1
+# #+PLEDGE_TFY0
+# #+PLEDGE_TFY1
+# #+PLEDGE_TFY2
+# #+PLEDGE_TFY3
+# #+PLEDGE_TFY4
+# #+NGC_TARGET_FY2
+# #+NGC_TARGET_FY1
+# +NGC_TFY0
+# +NGC_TFY1
+# +NGC_TFY2
+# +NGC_TFY3
+# +NGC_TFY4
+# #+AF_TARGET_FY2
+# #+AF_TARGET_FY1
+# +AF_TFY0
+# +AF_TFY1
+# +AF_TFY2
+# +AF_TFY3
+# #+AF_TFY4
+# #+CRU_TARGET_FY2
+# #+CRU_TARGET_FY1
+# #+CRU_TFY0
+# #+CRU_TFY1
+# +CRU_TFY2
+# +CRU_TFY3
+# +CRU_TFY4
+# #+CRU_STATUS
+# #+CRU_GIVING_SEGMENT
+# +GIFT_CLUB_KLC_YRS
+# +GIFT_CLUB_BEQUEST_YRS
+# +GIFT_CLUB_LOYAL_YRS
+# #+GIFT_CLUB_NU_LDR_YRS
+# +GIFT_CLUBS_TFY0
+# #+GIFT_CLUBS_TFY1
+# #+GIFT_CLUBS_TFY2
+# #+GIFT_CLUBS_TFY3
+# #+GIFT_CLUBS_TFY4
+# +EVALUATION_LOWER_BOUND
+# +UOR_LOWER_BOUND
+# +KSM_PROSPECT_ACTIVE
+# +KSM_PROSPECT_ANY
+# +KSM_GOS
+# +KSM_GOS_FLAG
+# +MONTHS_ASSIGNED
+# #+PAST_KSM_GOS ### getting an error for the mse when adding this to the model
+# +PAST_KSM_GOS_FLAG
+# +PAST_GO_MONTHS_ASSIGNED
+# +PAST_GO_MONTHS_SINCE_ASSIGNED
+# +VISITS_TFY0
+# #+VISITS_TFY1
+# #+VISITS_TFY2
+# #+VISITS_TFY3
+# #+VISITS_TFY4
+# #+VISITORS_TFY0
+# #+VISITORS_TFY1
+# #+VISITORS_TFY2
+# #+VISITORS_TFY3
+# #+VISITORS_TFY4
+# #+COMMITTEE_NU_DISTINCT
+# #+COMMITTEE_NU_ACTIVE
+# #+COMMITTEE_NU_YEARS
+# #+COMMITTEE_KSM_DISTINCT
+# +COMMITTEE_KSM_ACTIVE
+# +COMMITTEE_KSM_YEARS
+# +COMMITTEE_KSM_LDR
+# #+COMMITTEE_KSM_LDR_ACTIVE
+# +COMMITTEES_TFY0
+# #+COMMITTEES_TFY1
+# +COMMITTEES_TFY2
+# +COMMITTEES_TFY3
+# #+COMMITTEES_TFY4
+# #+EVENTS_ATTENDED # compare this column with events_ty0-4 to see which is a better predictor
+# #+EVENTS_YRS
+# #+EVENTS_PREV_3_FY
+# +KSM_EVENTS_ATTENDED
+# #+KSM_EVENTS_YRS
+# #+KSM_EVENTS_PREV_3_FY
+# +KSM_EVENTS_REUNIONS
+# +EVENTS_TFY0
+# +EVENTS_TFY1
+# +EVENTS_TFY2
+# +EVENTS_TFY3
+# +EVENTS_TFY4
+# #+KSM_SPEAKER_YEARS
+# +KSM_SPEAKER_TIMES
+# #+KSM_FEATURED_COMM_YEARS
+# +KSM_FEATURED_COMM_TIMES
+# #+KSM_CORP_RECRUITER_YEARS
+# +KSM_CORP_RECRUITER_TIMES
+# +ATHLETICS_TICKET_YEARS
+# #+ATHLETICS_TICKET_LAST
+# +ACTIVITIES_TFY0
+# #+ACTIVITIES_TFY1
+# #+ACTIVITIES_TFY2
+# #+ACTIVITIES_TFY3
+# #+ACTIVITIES_TFY4
+# +MANAGED_STATUS
+# +PHONE_COUNT
+# #+EMAIL_COUNT ## check to see if email tfy0-4 is better predicot
+# +EVENT_COUNT
+# +HAS_UNIVERSITY_STRATEGY_FLAG
+# #+STRATEGY_SCHED_DATE ### no data....
+# +DEDUPED_CHILDREN_COUNT
+# +DEDUPED_CHILDREN_NU_COUNT
+# +EMAIL_TFY0
+# +EMAIL_TFY1
+# +EMAIL_TFY2
+# +EMAIL_TFY3
+# +EMAIL_TFY4
+# +PHONE_TFY0
+# +PHONE_TFY1
+# +PHONE_TFY2
+# +PHONE_TFY3
+# +PHONE_TFY4
+# ### THIS IS NOT THE FULL DATASET, just for calculating an unbiased MSE
+#    , data = curr_train
+#    , importance = 'impurity' ### should I use this condition for the random forest?
+#  )
+
+
+```
+
+```{r}
+# gam_test3_model %>% summary()
+```
+
+
+```{r}
+# mse(
+#     prediction = gam_test3_model %>% predict(newdata = curr_test, type = "response")
+#     , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+#   )
+```
+
+```{r}
+#HOW TO AGGREGATE COLUMNS?
+
+gam_test4_model <- gam(log10(NGC_TARGET_FY2 + NGC_TARGET_FY1 + 1) ~
+# RN
+#+TRAINING_FY
+#+TARGET_FY1
+#+TARGET_FY2
+#+DATA_AS_OF
+#+ID_NUMBER
+#+REPORT_NAME
+#RECORD_STATUS_CODE
+#+HOUSEHOLD_RECORD
+#+HOUSEHOLD_ID
+#+HH_PRIMARY
+#+INSTITUTIONAL_SUFFIX
++FIRST_KSM_YEAR
+#+BIRTH_DT
+#+ENTITY_DT_ADDED
+#+DEGREES_CONCAT
++PROGRAM_GROUP
+#+SPOUSE_FIRST_KSM_YEAR
+#+SPOUSE_SUFFIX
++PREF_ADDR_TYPE_CODE
+#+HOUSEHOLD_CITY
+#+HOUSEHOLD_STATE
+#+HOUSEHOLD_COUNTRY
++HOUSEHOLD_CONTINENT
++BUS_IS_EMPLOYED
++HAS_HOME_ADDR
++HAS_ALT_HOME_ADDR
++HAS_BUS_ADDR
++HAS_SEASONAL_ADDR
++HAS_HOME_PHONE
++HAS_BUS_PHONE
++HAS_MOBILE_PHONE
++HAS_HOME_EMAIL
++HAS_BUS_EMAIL
+# +GIVING_FIRST_YEAR 
++GIVING_FIRST_YEAR_CASH_AMT
++GIVING_FIRST_YEAR_PLEDGE_AMT
++GIVING_MAX_CASH_FY ## can I include FY in model?
+#+GIVING_MAX_CASH_DT ### no data....
+#+GIVING_MAX_CASH_AMT
++GIVING_MAX_PLEDGE_FY ## can I include FY in model?
+#+GIVING_MAX_PLEDGE_DT ### no data....
+# +GIVING_MAX_PLEDGE_AMT 
+#+GIVING_CASH_TOTAL
+#+GIVING_PLEDGE_TOTAL
+#+GIVING_NGC_TOTAL
++GIVING_AF_TOTAL
++GIVING_CRU_TOTAL
++GIFTS_ALLOCS_SUPPORTED
++GIFTS_FYS_SUPPORTED
+#+GIFTS_CASH
++GIFTS_CREDIT_CARD
++GIFTS_STOCK
+#+GIFTS_OUTRIGHTS_PAYMENTS
++GIFTS_PLEDGES
++GIFTS_PLEDGES_NEVER_PAID
++GIFTS_MATCHES
++DAF_GIFTS
++DAF_GIFTS_AMT
+#+PLEDGE_BALANCE
+#+NU_PLANNED_GIVING
+#+CASH_TARGET_FY2
+#+CASH_TARGET_FY1
+#+CASH_TFY0
++CASH_TFY1
++CASH_TFY2
++CASH_TFY3
++CASH_TFY4
+#+PLEDGE_TARGET_FY2
+#+PLEDGE_TARGET_FY1
+#+PLEDGE_TFY0
+#+PLEDGE_TFY1
+#+PLEDGE_TFY2
+#+PLEDGE_TFY3
+#+PLEDGE_TFY4
+#+NGC_TARGET_FY2
+#+NGC_TARGET_FY1
++NGC_TFY0
++NGC_TFY1
++NGC_TFY2
++NGC_TFY3
++NGC_TFY4
+#+AF_TARGET_FY2
+#+AF_TARGET_FY1
++AF_TFY0
++AF_TFY1
++AF_TFY2
++AF_TFY3
+#+AF_TFY4
+#+CRU_TARGET_FY2
+#+CRU_TARGET_FY1
+#+CRU_TFY0
+#+CRU_TFY1
++CRU_TFY2
++CRU_TFY3
++CRU_TFY4
+#+CRU_STATUS
+#+CRU_GIVING_SEGMENT
++GIFT_CLUB_KLC_YRS
++GIFT_CLUB_BEQUEST_YRS
++GIFT_CLUB_LOYAL_YRS
+#+GIFT_CLUB_NU_LDR_YRS
++GIFT_CLUBS_TFY0
+#+GIFT_CLUBS_TFY1
+#+GIFT_CLUBS_TFY2
+#+GIFT_CLUBS_TFY3
+#+GIFT_CLUBS_TFY4
++EVALUATION_LOWER_BOUND
++UOR_LOWER_BOUND
++KSM_PROSPECT_ACTIVE
++KSM_PROSPECT_ANY
++KSM_GOS
++KSM_GOS_FLAG
++MONTHS_ASSIGNED
+#+PAST_KSM_GOS ### getting an error for the mse when adding this to the model
++PAST_KSM_GOS_FLAG
++PAST_GO_MONTHS_ASSIGNED
++PAST_GO_MONTHS_SINCE_ASSIGNED
++VISITS_TFY0
+#+VISITS_TFY1
+#+VISITS_TFY2
+#+VISITS_TFY3
+#+VISITS_TFY4
+#+VISITORS_TFY0
+#+VISITORS_TFY1
+#+VISITORS_TFY2
+#+VISITORS_TFY3
+#+VISITORS_TFY4
+#+COMMITTEE_NU_DISTINCT
+#+COMMITTEE_NU_ACTIVE
+#+COMMITTEE_NU_YEARS
+#+COMMITTEE_KSM_DISTINCT
++COMMITTEE_KSM_ACTIVE
++COMMITTEE_KSM_YEARS
++COMMITTEE_KSM_LDR
+#+COMMITTEE_KSM_LDR_ACTIVE
++COMMITTEES_TFY0
+#+COMMITTEES_TFY1
++COMMITTEES_TFY2
++COMMITTEES_TFY3
+#+COMMITTEES_TFY4
+#+EVENTS_ATTENDED # compare this column with events_ty0-4 to see which is a better predictor
+#+EVENTS_YRS
+#+EVENTS_PREV_3_FY
++KSM_EVENTS_ATTENDED
+#+KSM_EVENTS_YRS
+#+KSM_EVENTS_PREV_3_FY
++KSM_EVENTS_REUNIONS
++EVENTS_TFY0
++EVENTS_TFY1
++EVENTS_TFY2
++EVENTS_TFY3
++EVENTS_TFY4
+#+KSM_SPEAKER_YEARS
++KSM_SPEAKER_TIMES
+#+KSM_FEATURED_COMM_YEARS
++KSM_FEATURED_COMM_TIMES
+#+KSM_CORP_RECRUITER_YEARS
++KSM_CORP_RECRUITER_TIMES
++ATHLETICS_TICKET_YEARS
+#+ATHLETICS_TICKET_LAST
++ACTIVITIES_TFY0
+#+ACTIVITIES_TFY1
+#+ACTIVITIES_TFY2
+#+ACTIVITIES_TFY3
+#+ACTIVITIES_TFY4
++MANAGED_STATUS
++PHONE_COUNT
+#+EMAIL_COUNT ## check to see if email tfy0-4 is better predicot
++EVENT_COUNT
++HAS_UNIVERSITY_STRATEGY_FLAG
+#+STRATEGY_SCHED_DATE ### no data....
++DEDUPED_CHILDREN_COUNT
++DEDUPED_CHILDREN_NU_COUNT
+#+(EMAIL_TFY0 + EMAIL_TFY1 + EMAIL_TFY2 + EMAIL_TFY3 + EMAIL_TFY4) #### HOW TO SUM COLUMNS?????
+#+ email_sum
++ I(EMAIL_TFY0 + EMAIL_TFY1 + EMAIL_TFY2 + EMAIL_TFY3 + EMAIL_TFY4)
++ phone_sum
+   , data = curr_train %>% mutate(
+     email_sum = EMAIL_TFY0 + EMAIL_TFY1 + EMAIL_TFY2 + EMAIL_TFY3 + EMAIL_TFY4
+     , phone_sum = PHONE_TFY0 + PHONE_TFY1 + PHONE_TFY2 + PHONE_TFY3 + PHONE_TFY4
+   )
+   , importance = 'impurity'
+ )
+
+# Pseudocode for variable transformations
+# data %>%
+#   mutate(
+#     new_var = operations
+#     , new_var2 = other_operations
+#   ) %>%
+#   lm(
+#     y ~ x + new_var + new_var2
+#     , data = .
+#   )
+```
+
+
+```{r}
+gam_test4_model%>% summary()
+```
+
+
+```{r}
+### what is the difference between data and newdata when predicting?
+# 
+# mse(
+#     prediction = gam_test4_model %>% predict(newdata = curr_test, type = "response")
+#     , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+#   )
+```
+
+
+
+
+
+```{r}
+svm_test_model <- svm(log10(NGC_TARGET_FY2 + NGC_TARGET_FY1 + 1) ~ 
+# RN
+#+TRAINING_FY
+#+TARGET_FY1
+#+TARGET_FY2
+#+DATA_AS_OF
+#+ID_NUMBER
+#+REPORT_NAME
+#RECORD_STATUS_CODE
+#+HOUSEHOLD_RECORD
+#+HOUSEHOLD_ID
+#+HH_PRIMARY
+#+INSTITUTIONAL_SUFFIX
++FIRST_KSM_YEAR
+#+BIRTH_DT
+#+ENTITY_DT_ADDED
+#+DEGREES_CONCAT
++PROGRAM_GROUP
+#+SPOUSE_FIRST_KSM_YEAR
+#+SPOUSE_SUFFIX
++PREF_ADDR_TYPE_CODE
+#+HOUSEHOLD_CITY
+#+HOUSEHOLD_STATE
+#+HOUSEHOLD_COUNTRY
++HOUSEHOLD_CONTINENT
++BUS_IS_EMPLOYED
++HAS_HOME_ADDR
++HAS_ALT_HOME_ADDR
++HAS_BUS_ADDR
++HAS_SEASONAL_ADDR
++HAS_HOME_PHONE
++HAS_BUS_PHONE
++HAS_MOBILE_PHONE
++HAS_HOME_EMAIL
++HAS_BUS_EMAIL
+# +GIVING_FIRST_YEAR 
++GIVING_FIRST_YEAR_CASH_AMT
++GIVING_FIRST_YEAR_PLEDGE_AMT
++GIVING_MAX_CASH_FY ## can I include FY in model?
+#+GIVING_MAX_CASH_DT ### no data....
+#+GIVING_MAX_CASH_AMT
++GIVING_MAX_PLEDGE_FY ## can I include FY in model?
+#+GIVING_MAX_PLEDGE_DT ### no data....
+# +GIVING_MAX_PLEDGE_AMT 
+#+GIVING_CASH_TOTAL
+#+GIVING_PLEDGE_TOTAL
+#+GIVING_NGC_TOTAL
++GIVING_AF_TOTAL
++GIVING_CRU_TOTAL
++GIFTS_ALLOCS_SUPPORTED
++GIFTS_FYS_SUPPORTED
+#+GIFTS_CASH
++GIFTS_CREDIT_CARD
++GIFTS_STOCK
+#+GIFTS_OUTRIGHTS_PAYMENTS
++GIFTS_PLEDGES
++GIFTS_PLEDGES_NEVER_PAID
++GIFTS_MATCHES
++DAF_GIFTS
++DAF_GIFTS_AMT
+#+PLEDGE_BALANCE
+#+NU_PLANNED_GIVING
+#+CASH_TARGET_FY2
+#+CASH_TARGET_FY1
+#+CASH_TFY0
++CASH_TFY1
++CASH_TFY2
++CASH_TFY3
++CASH_TFY4
+#+PLEDGE_TARGET_FY2
+#+PLEDGE_TARGET_FY1
+#+PLEDGE_TFY0
+#+PLEDGE_TFY1
+#+PLEDGE_TFY2
+#+PLEDGE_TFY3
+#+PLEDGE_TFY4
+#+NGC_TARGET_FY2
+#+NGC_TARGET_FY1
++NGC_TFY0
++NGC_TFY1
++NGC_TFY2
++NGC_TFY3
++NGC_TFY4
+#+AF_TARGET_FY2
+#+AF_TARGET_FY1
++AF_TFY0
++AF_TFY1
++AF_TFY2
++AF_TFY3
+#+AF_TFY4
+#+CRU_TARGET_FY2
+#+CRU_TARGET_FY1
+#+CRU_TFY0
+#+CRU_TFY1
++CRU_TFY2
++CRU_TFY3
++CRU_TFY4
+#+CRU_STATUS
+#+CRU_GIVING_SEGMENT
++GIFT_CLUB_KLC_YRS
++GIFT_CLUB_BEQUEST_YRS
++GIFT_CLUB_LOYAL_YRS
+#+GIFT_CLUB_NU_LDR_YRS
++GIFT_CLUBS_TFY0
+#+GIFT_CLUBS_TFY1
+#+GIFT_CLUBS_TFY2
+#+GIFT_CLUBS_TFY3
+#+GIFT_CLUBS_TFY4
++EVALUATION_LOWER_BOUND
++UOR_LOWER_BOUND
++KSM_PROSPECT_ACTIVE
++KSM_PROSPECT_ANY
++KSM_GOS
++KSM_GOS_FLAG
++MONTHS_ASSIGNED
+#+PAST_KSM_GOS ### getting an error for the mse when adding this to the model
++PAST_KSM_GOS_FLAG
++PAST_GO_MONTHS_ASSIGNED
++PAST_GO_MONTHS_SINCE_ASSIGNED
++VISITS_TFY0
+#+VISITS_TFY1
+#+VISITS_TFY2
+#+VISITS_TFY3
+#+VISITS_TFY4
+#+VISITORS_TFY0
+#+VISITORS_TFY1
+#+VISITORS_TFY2
+#+VISITORS_TFY3
+#+VISITORS_TFY4
+#+COMMITTEE_NU_DISTINCT
+#+COMMITTEE_NU_ACTIVE
+#+COMMITTEE_NU_YEARS
+#+COMMITTEE_KSM_DISTINCT
++COMMITTEE_KSM_ACTIVE
++COMMITTEE_KSM_YEARS
++COMMITTEE_KSM_LDR
+#+COMMITTEE_KSM_LDR_ACTIVE
++COMMITTEES_TFY0
+#+COMMITTEES_TFY1
++COMMITTEES_TFY2
++COMMITTEES_TFY3
+#+COMMITTEES_TFY4
+#+EVENTS_ATTENDED # compare this column with events_ty0-4 to see which is a better predictor
+#+EVENTS_YRS
+#+EVENTS_PREV_3_FY
++KSM_EVENTS_ATTENDED
+#+KSM_EVENTS_YRS
+#+KSM_EVENTS_PREV_3_FY
++KSM_EVENTS_REUNIONS
++EVENTS_TFY0
++EVENTS_TFY1
++EVENTS_TFY2
++EVENTS_TFY3
++EVENTS_TFY4
+#+KSM_SPEAKER_YEARS
++KSM_SPEAKER_TIMES
+#+KSM_FEATURED_COMM_YEARS
++KSM_FEATURED_COMM_TIMES
+#+KSM_CORP_RECRUITER_YEARS
++KSM_CORP_RECRUITER_TIMES
++ATHLETICS_TICKET_YEARS
+#+ATHLETICS_TICKET_LAST
++ACTIVITIES_TFY0
+#+ACTIVITIES_TFY1
+#+ACTIVITIES_TFY2
+#+ACTIVITIES_TFY3
+#+ACTIVITIES_TFY4
++MANAGED_STATUS
++PHONE_COUNT
+#+EMAIL_COUNT ## check to see if email tfy0-4 is better predicot
++EVENT_COUNT
++HAS_UNIVERSITY_STRATEGY_FLAG
+#+STRATEGY_SCHED_DATE ### no data....
++DEDUPED_CHILDREN_COUNT
++DEDUPED_CHILDREN_NU_COUNT
++EMAIL_TFY0
++EMAIL_TFY1
++EMAIL_TFY2
++EMAIL_TFY3
++EMAIL_TFY4
++PHONE_TFY0
++PHONE_TFY1
++PHONE_TFY2
++PHONE_TFY3
++PHONE_TFY4
+, data = curr_train
+#, na.action = na.omit
+)
+
+
+```
+
+```{r}
+### what is the difference between data and newdata when predicting?
+
+mse(
+    prediction = svm_test_model %>% predict(newdata = curr_test, type = "response")
+    , observed = log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1)
+  )
+
+# take the sum of squared residuals
+(mse_2 <- sqrt((svm_test_model$residuals)^2) %>% mean(na.rm = TRUE) %>% return())
+
+# mse <- function(prediction, observed) {
+#   sqrt((observed - prediction)^2) %>%
+#     mean(na.rm = TRUE) %>%
+#     return()
+# }
+
+
+```
+
+```{r}
+svm_test_model %>% summary()
+```
+
+
+```{r}
+svm_prediction <- predict(svm_test_model, curr_test)
+
+x = 1:length(log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1))
+plot(x, log10(curr_test$NGC_TARGET_FY2 + curr_test$NGC_TARGET_FY1 + 1), pch=18, col="red")
+lines(x, svm_test_model, lwd="1", col="blue")
+```
+
+
+
+
+
